@@ -15,5 +15,17 @@
     "hint": "选择用于价格对比的Steam区，选择'NONE'则不进行对比",
     "options": ["NONE", "UA", "US", "JP", "KR", "RU", "CN", "TR"],
     "default": "NONE"
+  },
+  "PRICE_MONITOR_INTERVAL": {
+    "description": "价格监控检查间隔（分钟）",
+    "type": "int",
+    "hint": "价格监控的检查间隔时间，建议30-60分钟",
+    "default": 30
+  },
+  "ENABLE_PRICE_MONITOR": {
+    "description": "启用价格监控功能",
+    "type": "bool",
+    "hint": "是否启用价格监控功能",
+    "default": true
   }
 }

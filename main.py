@@ -3,11 +3,15 @@ import httpx
 import traceback
 import asyncio  # 补充导入
 import datetime
+import json
+import os
+from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from .price_convert import to_cny
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 ITAD_API_BASE = "https://api.isthereanydeal.com"
 STEAMWEBAPI_PRICES = "https://api.steamwebapi.com/steam/prices"
@@ -20,6 +24,37 @@ class SteamPricePlugin(Star):
         self.itad_api_key = self.config.get("ITAD_API_KEY", "")
         self.steamwebapi_key = self.config.get("STEAMWEBAPI_KEY", "")
         self.compare_region = self.config.get("STEAM_COMPARE_REGION", "UA")
+        
+        # 价格监控相关初始化
+        self.enable_price_monitor = self.config.get("ENABLE_PRICE_MONITOR", True)
+        self.monitor_interval = self.config.get("PRICE_MONITOR_INTERVAL", 30)
+        
+        # 数据文件路径
+        self.data_dir = Path(StarTools.get_data_dir("astrbot_plugins_steam_shop_price"))
+        self.monitor_list_path = self.data_dir / "price_monitor_list.json"
+        
+        # 确保数据目录存在
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化监控列表
+        self.monitor_list = {}
+        self.monitor_list_lock = asyncio.Lock()
+        
+        # 初始化调度器
+        self.scheduler = AsyncIOScheduler()
+        
+        # 如果启用价格监控，启动定时任务
+        if self.enable_price_monitor:
+            self.scheduler.add_job(
+                self.run_price_monitor, 
+                "interval", 
+                minutes=self.monitor_interval
+            )
+            self.scheduler.start()
+            logger.info(f"价格监控功能已启用，检查间隔：{self.monitor_interval}分钟")
+        
+        # 加载监控列表
+        asyncio.create_task(self.load_monitor_list())
 
     @filter.command("史低")
     async def shidi(self, event: AstrMessageEvent, url: str, last_gid=None):
@@ -31,13 +66,17 @@ class SteamPricePlugin(Star):
         param_str = re.sub(prefix_pattern, "", raw_msg, count=1, flags=re.IGNORECASE)
         # param_str 现在包含所有参数（包括空格和数字）
         if not param_str.lower().startswith("http"):
-            game_en_name = param_str
-            if not re.search(r'[\u4e00-\u9fff]', game_en_name):
-                logger.info(f"[史低] 检测到无中文，直接使用原始输入: {game_en_name}")
-                yield event.plain_result(f"正在为主人搜索《{game_en_name}》，主人等一小会喵...")
-            else:
+            # 检查是否为中文游戏名
+            is_chinese = re.search(r'[\u4e00-\u9fff]', param_str)
+            
+            # 使用ITAD API搜索（优先使用英文搜索）
+            search_name = param_str
+            appid = None
+            
+            if is_chinese:
+                # 如果是中文游戏名，先尝试翻译为英文进行ITAD搜索
                 try:
-                    prompt = f"请将以下游戏名翻译为steam页面的英文官方名称，仅输出英文名，不要输出其他内容：{param_str}"
+                    prompt = f"请将以下游戏名翻译为steam商店页面的英文官方名称，仅输出英文名，不要输出其他内容：{param_str}"
                     llm_response = await self.context.get_using_provider().text_chat(
                         prompt=prompt,
                         contexts=[],
@@ -45,92 +84,143 @@ class SteamPricePlugin(Star):
                         func_tool=None,
                         system_prompt=""
                     )
-                    game_en_name = llm_response.completion_text.strip()
-                    logger.info(f"[LLM][翻译游戏名] 输出: {game_en_name}")
-                    yield event.plain_result(f"正在为主人搜索《{game_en_name}》，主人等一小会喵...")
+                    search_name = llm_response.completion_text.strip()
+                    logger.info(f"[LLM][翻译游戏名] 中文: {param_str} -> 英文: {search_name}")
                 except Exception as e:
                     logger.error(f"LLM翻译游戏名失败: {e}")
-                    yield event.plain_result("游戏名翻译失败，请重试或直接输入Steam商店链接。")
-                    return
-            # ...后续逻辑保持不变...
+                    # 翻译失败，继续使用中文搜索
+                    search_name = param_str
+            
+            yield event.plain_result(f"正在为主人搜索《{param_str}》，主人等一小会喵...")
+            
+            # 第一步：使用ITAD API搜索（英文）
             try:
                 async with httpx.AsyncClient(timeout=20) as client:
                     resp = await client.get(
                         f"{ITAD_API_BASE}/games/search/v1",
-                        params={"key": self.itad_api_key, "title": game_en_name, "limit": 5}
+                        params={"key": self.itad_api_key, "title": search_name, "limit": 5}
                     )
                     data = resp.json()
-                    logger.info(f"[ITAD][search] 成功获取候选项，共{len(data) if isinstance(data, list) else 0}个")
-                    if not data or not isinstance(data, list):
-                        yield event.plain_result("未找到该游戏，请检查名称或输入Steam商店链接。")
-                        return
-                    def norm(s):
-                        return s.lower().replace(" ", "") if s else ""
-                    norm_en = norm(game_en_name)
-                    candidates = [g for g in data if g.get("type") == "game"]
-                    if not candidates:
-                        candidates = data
-                    best = None
-                    for g in candidates:
-                        title = g.get("title", "")
-                        if norm(title) == norm_en:
-                            best = g
-                            break
-                    if not best:
-                        for g in candidates:
-                            title = g.get("title", "")
-                            if norm_en in norm(title) or norm(title) in norm_en:
-                                best = g
-                                break
-                    # 总是展示“猜你想搜”候选项（不论是否全字匹配）
-                    candidate_names = [g.get("title", "未知") for g in candidates[1:6]]
-                    yield event.plain_result(
-                        "为主人查询史低信息喵~稍等稍等...\n"
-                        + (f"猜你想搜：\n" + "\n".join(candidate_names) if candidate_names else "")
-                    )
-                    # 如果没有完全匹配，依然继续查第一个候选项（即 best = candidates[0]），否则流程会中断
-                    if not best:
-                        if candidates:
-                            best = candidates[0]
+                    
+                    if data and isinstance(data, list) and len(data) > 0:
+                        # 取第一个匹配的游戏
+                        game = data[0]
+                        game_name = game.get("title", "")
+                        
+                        # 获取AppID
+                        for url_item in game.get("urls", []):
+                            if "store.steampowered.com/app/" in url_item:
+                                match = re.match(r".*store\.steampowered\.com/app/(\d+).*", url_item)
+                                if match:
+                                    appid = match.group(1)
+                                    break
+                        
+                        if appid:
+                            logger.info(f"[ITAD搜索成功] 游戏: {game_name}, AppID: {appid}")
                         else:
-                            # 没有候选项，直接返回
-                            return
-                    game = best
-                    steam_url = ""
-                    for url_item in game.get("urls", []):
-                        if "store.steampowered.com/app" in url_item:
-                            steam_url = url_item
-                            break
-                    # 这里加超时保护，防止ITAD接口长时间无响应导致流程卡死
-                    try:
-                        if not steam_url and game.get("id"):
-                            async with httpx.AsyncClient(timeout=20) as client2:
-                                resp2 = await asyncio.wait_for(
-                                    client2.get(
-                                        f"{ITAD_API_BASE}/games/info/v2",
-                                        params={"key": self.itad_api_key, "id": game["id"]}
-                                    ),
-                                    timeout=12
-                                )
-                                info2 = resp2.json()
-                                appid = info2.get("appid")
-                                if appid:
-                                    steam_url = f"https://store.steampowered.com/app/{appid}"
-                    except Exception as e:
-                        logger.error(f"通过ITAD gid查appid失败: {e}\n{traceback.format_exc()}")
-                    # 修正：查到 steam_url 后只查一次，不递归自身，避免无限循环
-                    if steam_url:
-                        # 直接进入链接查询流程
-                        async for result in self._query_by_url(event, steam_url):
-                            yield result
-                        return
+                            logger.warning(f"[ITAD搜索] 找到游戏但无法获取AppID: {game_name}")
+                            appid = None
                     else:
-                        yield event.plain_result("未找到该游戏的Steam商店链接，或链接格式异常。请尝试更换游戏名称或直接输入Steam商店链接。")
-                        return
+                        logger.warning(f"[ITAD搜索] 未找到游戏: {search_name}")
+                        appid = None
+                        
             except Exception as e:
-                logger.error(f"ITAD搜索失败: {e}\n{traceback.format_exc()}")
-                yield event.plain_result("游戏搜索失败，请重试或直接输入Steam商店链接。")
+                logger.error(f"ITAD搜索失败: {e}")
+                appid = None
+            
+            # 第二步：如果ITAD搜索失败且是中文游戏名，尝试中文备用搜索
+            if not appid and is_chinese:
+                try:
+                    logger.info(f"[备用搜索-中文] 尝试中文搜索: {param_str}")
+                    # 使用Steam商店搜索API（中文）
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(
+                            "https://store.steampowered.com/api/storesearch/",
+                            params={"term": param_str, "l": "schinese", "cc": "CN"}
+                        )
+                        data = resp.json()
+                        
+                        if data and data.get("total", 0) > 0:
+                            # 取第一个匹配的游戏
+                            game = data["items"][0]
+                            appid = str(game.get("id", ""))
+                            game_name = game.get("name", "")
+                            
+                            if appid:
+                                logger.info(f"[备用搜索-中文成功] 游戏: {game_name}, AppID: {appid}")
+                            else:
+                                logger.warning(f"[备用搜索-中文] 找到游戏但无法获取AppID: {game_name}")
+                        else:
+                            logger.warning(f"[备用搜索-中文] 未找到游戏: {param_str}")
+                            
+                except Exception as e:
+                    logger.error(f"备用搜索-中文失败: {e}")
+            
+            # 第三步：如果中文搜索也失败，尝试英文备用搜索
+            if not appid and is_chinese and search_name != param_str:
+                try:
+                    logger.info(f"[备用搜索-英文] 尝试英文搜索: {search_name}")
+                    # 使用Steam商店搜索API（英文）
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(
+                            "https://store.steampowered.com/api/storesearch/",
+                            params={"term": search_name, "l": "english", "cc": "US"}
+                        )
+                        data = resp.json()
+                        
+                        if data and data.get("total", 0) > 0:
+                            # 取第一个匹配的游戏
+                            game = data["items"][0]
+                            appid = str(game.get("id", ""))
+                            game_name = game.get("name", "")
+                            
+                            if appid:
+                                logger.info(f"[备用搜索-英文成功] 游戏: {game_name}, AppID: {appid}")
+                            else:
+                                logger.warning(f"[备用搜索-英文] 找到游戏但无法获取AppID: {game_name}")
+                        else:
+                            logger.warning(f"[备用搜索-英文] 未找到游戏: {search_name}")
+                            
+                except Exception as e:
+                    logger.error(f"备用搜索-英文失败: {e}")
+            
+            # 第四步：如果是英文游戏名且ITAD搜索失败，尝试英文备用搜索
+            if not appid and not is_chinese:
+                try:
+                    logger.info(f"[备用搜索-英文] 尝试英文搜索: {param_str}")
+                    # 使用Steam商店搜索API（英文）
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(
+                            "https://store.steampowered.com/api/storesearch/",
+                            params={"term": param_str, "l": "english", "cc": "US"}
+                        )
+                        data = resp.json()
+                        
+                        if data and data.get("total", 0) > 0:
+                            # 取第一个匹配的游戏
+                            game = data["items"][0]
+                            appid = str(game.get("id", ""))
+                            game_name = game.get("name", "")
+                            
+                            if appid:
+                                logger.info(f"[备用搜索-英文成功] 游戏: {game_name}, AppID: {appid}")
+                            else:
+                                logger.warning(f"[备用搜索-英文] 找到游戏但无法获取AppID: {game_name}")
+                        else:
+                            logger.warning(f"[备用搜索-英文] 未找到游戏: {param_str}")
+                            
+                except Exception as e:
+                    logger.error(f"备用搜索-英文失败: {e}")
+            
+            if not appid:
+                yield event.plain_result("未找到该游戏，请检查游戏名是否正确，或尝试直接输入Steam商店链接。")
                 return
+            
+            # 如果成功获取到AppID，直接进入链接查询流程
+            steam_url = f"https://store.steampowered.com/app/{appid}"
+            async for result in self._query_by_url(event, steam_url):
+                yield result
+            return
         else:
             url = param_str
             # 直接进入链接查询流程
@@ -561,9 +651,13 @@ class SteamPricePlugin(Star):
                 data = resp.json()
                 # 只输出关键信息
                 logger.info(f"[ITAD][prices][{country}] 成功获取价格和史低信息")
-                logger.debug(f"[ITAD][prices][{country}] historyLow调试: {data[0].get('historyLow', {})}")
-                if not data or not isinstance(data, list) or not data[0].get("deals"):
+                
+                # 先检查数据有效性，再访问数组元素
+                if not data or not isinstance(data, list) or len(data) == 0 or not data[0].get("deals"):
+                    logger.warning(f"[ITAD][prices][{country}] 未找到价格数据或数据格式错误")
                     return None, None, None, None
+                
+                logger.debug(f"[ITAD][prices][{country}] historyLow调试: {data[0].get('historyLow', {})}")
                 deals = data[0]["deals"]
                 # 取Steam的当前价和原价
                 price = None
@@ -587,3 +681,530 @@ class SteamPricePlugin(Star):
         except Exception as e:
             logger.error(f"_get_price_and_lowest error: {e}\n{traceback.format_exc()}")
             return None, None, None, None
+
+    # ==================== 价格监控功能 ====================
+
+    async def load_monitor_list(self):
+        """加载价格监控列表"""
+        try:
+            if self.monitor_list_path.exists():
+                async with self.monitor_list_lock:
+                    with open(self.monitor_list_path, 'r', encoding='utf-8') as f:
+                        self.monitor_list = json.load(f)
+                logger.info(f"价格监控列表加载成功，共 {len(self.monitor_list)} 个游戏")
+            else:
+                # 创建空的监控列表文件
+                async with self.monitor_list_lock:
+                    with open(self.monitor_list_path, 'w', encoding='utf-8') as f:
+                        json.dump({}, f, ensure_ascii=False, indent=2)
+                logger.info("创建新的价格监控列表文件")
+        except Exception as e:
+            logger.error(f"加载价格监控列表失败: {e}")
+            self.monitor_list = {}
+
+    async def save_monitor_list(self):
+        """保存价格监控列表"""
+        try:
+            async with self.monitor_list_lock:
+                with open(self.monitor_list_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.monitor_list, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存价格监控列表失败: {e}")
+
+    def _parse_unified_origin(self, origin: str):
+        """
+        解析 unified_msg_origin 字符串，提取平台、消息类型、用户ID和群ID
+        格式示例: aiocqhttp:FriendMessage:UserID
+                  aiocqhttp:GroupMessage:UserID_GroupID (带会话隔离)
+                  aiocqhttp:GroupMessage:GroupID (不带会话隔离)
+        """
+        parts = origin.split(":")
+        platform = parts[0]
+        message_type = parts[1]
+        identifiers = parts[2]
+
+        user_id = None
+        group_id = None
+
+        if message_type == "FriendMessage":
+            user_id = identifiers
+        elif message_type == "GroupMessage":
+            if "_" in identifiers:
+                user_id, group_id = identifiers.split("_")
+            else:
+                group_id = identifiers
+
+        return {
+            "platform": platform,
+            "message_type": message_type,
+            "user_id": user_id,
+            "group_id": group_id,
+        }
+
+    async def get_steam_price_for_monitor(self, appid, region="cn"):
+        """
+        获取游戏价格信息（用于监控）
+        Args:
+            appid (str or int): Steam 游戏的 AppID
+            region (str): 区域代码，默认为 "cn" (中国)
+        Returns:
+            dict or None: 包含价格信息的字典，或 None（如果获取失败或游戏不存在）
+        """
+        try:
+            url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc={region}&l=zh-cn"
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url)
+                data = resp.json()
+
+            app_data = data.get(str(appid), {})
+            if not app_data.get("success"):
+                logger.warning(f"获取游戏 {appid} 价格失败或游戏不存在")
+                return None
+
+            game_data = app_data["data"]
+            
+            # 免费游戏
+            if game_data.get("is_free"):
+                return {
+                    "is_free": True,
+                    "current_price": 0,
+                    "original_price": 0,
+                    "discount": 100,
+                    "currency": "FREE",
+                    "name": game_data.get("name", f"AppID: {appid}")
+                }
+
+            price_info = game_data.get("price_overview")
+            if not price_info:
+                logger.info(f"游戏 {game_data.get('name', appid)} 没有价格信息")
+                return None
+
+            return {
+                "is_free": False,
+                "current_price": price_info["final"] / 100,  # 单位转换为元
+                "original_price": price_info["initial"] / 100,
+                "discount": price_info["discount_percent"],
+                "currency": price_info["currency"],
+                "name": game_data.get("name", f"AppID: {appid}")
+            }
+        except Exception as e:
+            logger.error(f"获取游戏 {appid} 价格时发生异常：{e}")
+            return None
+
+    async def run_price_monitor(self):
+        """执行价格监控检查"""
+        if not self.enable_price_monitor:
+            return
+            
+        logger.info("开始执行价格监控检查")
+        
+        # 复制当前监控列表，避免在检查过程中被修改
+        current_monitor_list = self.monitor_list.copy()
+        
+        for appid, game_info in current_monitor_list.items():
+            try:
+                logger.info(f"检查游戏价格: {game_info.get('name', appid)}")
+                
+                # 获取当前价格
+                price_data = await self.get_steam_price_for_monitor(appid)
+                if not price_data:
+                    logger.warning(f"无法获取游戏 {appid} 的价格信息")
+                    continue
+
+                # 检查价格变动
+                last_price = game_info.get("last_price")
+                current_price = price_data["current_price"]
+                
+                # 首次记录价格
+                if last_price is None:
+                    self.monitor_list[appid]["last_price"] = current_price
+                    self.monitor_list[appid]["original_price"] = price_data["original_price"]
+                    self.monitor_list[appid]["discount"] = price_data["discount"]
+                    await self.save_monitor_list()
+                    logger.info(f"首次记录游戏 {price_data['name']} 价格: ¥{current_price:.2f}")
+                    continue
+
+                # 检查价格变动
+                price_change = current_price - last_price
+                
+                if price_change != 0:
+                    logger.info(f"检测到价格变动: {price_data['name']} 变动: ¥{price_change:.2f}")
+                    
+                    # 发送价格变动通知
+                    await self.send_price_change_notification(appid, game_info, price_data, price_change)
+                    
+                    # 更新价格记录
+                    self.monitor_list[appid]["last_price"] = current_price
+                    self.monitor_list[appid]["original_price"] = price_data["original_price"]
+                    self.monitor_list[appid]["discount"] = price_data["discount"]
+                    await self.save_monitor_list()
+                else:
+                    logger.info(f"游戏 {price_data['name']} 价格未变动")
+                    
+            except Exception as e:
+                logger.error(f"检查游戏 {appid} 价格时发生错误: {e}")
+        
+        logger.info("价格监控检查完成")
+
+    async def send_price_change_notification(self, appid, game_info, price_data, price_change):
+        """发送价格变动通知"""
+        try:
+            # 构建消息内容
+            if price_data["is_free"]:
+                message = f"🎉🎉🎉 游戏《{price_data['name']}》已免费！"
+            elif price_change > 0:
+                message = f"⬆️ 游戏《{price_data['name']}》价格上涨：¥{price_change:.2f}"
+            else:
+                message = f"⬇️ 游戏《{price_data['name']}》价格下跌：¥{-price_change:.2f}"
+            
+            message += f"\n变动前价格：¥{game_info['last_price']:.2f}"
+            message += f"\n当前价格：¥{price_data['current_price']:.2f}"
+            message += f"\n原价：¥{price_data['original_price']:.2f}"
+            message += f"\n折扣：{price_data['discount']}%"
+            message += f"\n购买链接：https://store.steampowered.com/app/{appid}"
+            
+            # 获取订阅者列表
+            subscribers = game_info.get("subscribers", [])
+            
+            for subscriber_origin in subscribers:
+                parsed_origin = self._parse_unified_origin(subscriber_origin)
+                
+                # 构建消息链
+                msg_components = [Comp.Plain(text=message)]
+                
+                # 群聊消息添加@功能
+                if parsed_origin["message_type"] == "GroupMessage" and parsed_origin["user_id"]:
+                    msg_components.append(Comp.At(qq=parsed_origin["user_id"]))
+                
+                # 发送消息
+                await self.context.send_message(
+                    subscriber_origin,
+                    MessageChain(msg_components)
+                )
+                
+                # 短暂延迟避免风控
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            logger.error(f"发送价格变动通知失败: {e}")
+
+    @filter.command("价格监控", alias={"订阅价格", "监控价格"})
+    async def price_monitor_command(self, event: AstrMessageEvent):
+        """价格监控命令 - 订阅游戏价格变动"""
+        args = event.message_str.strip().split()[1:]
+        
+        if len(args) < 1:
+            yield event.plain_result("使用方法：/价格监控 <游戏名或AppID>\n例如：/价格监控 Cyberpunk 2077 或 /价格监控 1091500")
+            return
+        
+        # 解析游戏名或AppID
+        input_text = " ".join(args)
+        
+        # 检查是否为AppID
+        if input_text.isdigit():
+            appid = input_text
+            # 验证AppID是否存在
+            try:
+                price_data = await self.get_steam_price_for_monitor(appid)
+                if not price_data:
+                    yield event.plain_result(f"未找到 AppID 为 {appid} 的游戏，请检查输入是否正确。")
+                    return
+                game_name = price_data["name"]
+            except Exception as e:
+                yield event.plain_result(f"验证游戏失败: {e}")
+                return
+        else:
+            # 通过游戏名搜索
+            yield event.plain_result(f"正在搜索游戏《{input_text}》，请稍候...")
+            
+            # 检查是否为中文游戏名
+            is_chinese = re.search(r'[\u4e00-\u9fff]', input_text)
+            
+            # 使用ITAD API搜索（优先使用英文搜索）
+            search_name = input_text
+            appid = None
+            
+            if is_chinese:
+                # 如果是中文游戏名，先尝试翻译为英文进行ITAD搜索
+                try:
+                    prompt = f"请将以下游戏名翻译为steam商店页面的英文官方名称，仅输出英文名，不要输出其他内容：{input_text}"
+                    llm_response = await self.context.get_using_provider().text_chat(
+                        prompt=prompt,
+                        contexts=[],
+                        image_urls=[],
+                        func_tool=None,
+                        system_prompt=""
+                    )
+                    search_name = llm_response.completion_text.strip()
+                    logger.info(f"[LLM][翻译游戏名] 中文: {input_text} -> 英文: {search_name}")
+                except Exception as e:
+                    logger.error(f"LLM翻译游戏名失败: {e}")
+                    # 翻译失败，继续使用中文搜索
+                    search_name = input_text
+            
+            # 第一步：使用ITAD API搜索（英文）
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.get(
+                        f"{ITAD_API_BASE}/games/search/v1",
+                        params={"key": self.itad_api_key, "title": search_name, "limit": 5}
+                    )
+                    data = resp.json()
+                    
+                    if data and isinstance(data, list) and len(data) > 0:
+                        # 取第一个匹配的游戏
+                        game = data[0]
+                        game_name = game.get("title", "")
+                        
+                        # 获取AppID
+                        for url_item in game.get("urls", []):
+                            if "store.steampowered.com/app/" in url_item:
+                                match = re.match(r".*store\.steampowered\.com/app/(\d+).*", url_item)
+                                if match:
+                                    appid = match.group(1)
+                                    break
+                        
+                        if appid:
+                            logger.info(f"[ITAD搜索成功] 游戏: {game_name}, AppID: {appid}")
+                        else:
+                            logger.warning(f"[ITAD搜索] 找到游戏但无法获取AppID: {game_name}")
+                            appid = None
+                    else:
+                        logger.warning(f"[ITAD搜索] 未找到游戏: {search_name}")
+                        appid = None
+                        
+            except Exception as e:
+                logger.error(f"ITAD搜索失败: {e}")
+                appid = None
+            
+            # 第二步：如果ITAD搜索失败且是中文游戏名，尝试中文备用搜索
+            if not appid and is_chinese:
+                try:
+                    logger.info(f"[备用搜索-中文] 尝试中文搜索: {input_text}")
+                    # 使用Steam商店搜索API（中文）
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(
+                            "https://store.steampowered.com/api/storesearch/",
+                            params={"term": input_text, "l": "schinese", "cc": "CN"}
+                        )
+                        data = resp.json()
+                        
+                        if data and data.get("total", 0) > 0:
+                            # 取第一个匹配的游戏
+                            game = data["items"][0]
+                            appid = str(game.get("id", ""))
+                            game_name = game.get("name", "")
+                            
+                            if appid:
+                                logger.info(f"[备用搜索-中文成功] 游戏: {game_name}, AppID: {appid}")
+                            else:
+                                logger.warning(f"[备用搜索-中文] 找到游戏但无法获取AppID: {game_name}")
+                        else:
+                            logger.warning(f"[备用搜索-中文] 未找到游戏: {input_text}")
+                            
+                except Exception as e:
+                    logger.error(f"备用搜索-中文失败: {e}")
+            
+            # 第三步：如果中文搜索也失败，尝试英文备用搜索
+            if not appid and is_chinese and search_name != input_text:
+                try:
+                    logger.info(f"[备用搜索-英文] 尝试英文搜索: {search_name}")
+                    # 使用Steam商店搜索API（英文）
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(
+                            "https://store.steampowered.com/api/storesearch/",
+                            params={"term": search_name, "l": "english", "cc": "US"}
+                        )
+                        data = resp.json()
+                        
+                        if data and data.get("total", 0) > 0:
+                            # 取第一个匹配的游戏
+                            game = data["items"][0]
+                            appid = str(game.get("id", ""))
+                            game_name = game.get("name", "")
+                            
+                            if appid:
+                                logger.info(f"[备用搜索-英文成功] 游戏: {game_name}, AppID: {appid}")
+                            else:
+                                logger.warning(f"[备用搜索-英文] 找到游戏但无法获取AppID: {game_name}")
+                        else:
+                            logger.warning(f"[备用搜索-英文] 未找到游戏: {search_name}")
+                            
+                except Exception as e:
+                    logger.error(f"备用搜索-英文失败: {e}")
+            
+            # 第四步：如果是英文游戏名且ITAD搜索失败，尝试英文备用搜索
+            if not appid and not is_chinese:
+                try:
+                    logger.info(f"[备用搜索-英文] 尝试英文搜索: {input_text}")
+                    # 使用Steam商店搜索API（英文）
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(
+                            "https://store.steampowered.com/api/storesearch/",
+                            params={"term": input_text, "l": "english", "cc": "US"}
+                        )
+                        data = resp.json()
+                        
+                        if data and data.get("total", 0) > 0:
+                            # 取第一个匹配的游戏
+                            game = data["items"][0]
+                            appid = str(game.get("id", ""))
+                            game_name = game.get("name", "")
+                            
+                            if appid:
+                                logger.info(f"[备用搜索-英文成功] 游戏: {game_name}, AppID: {appid}")
+                            else:
+                                logger.warning(f"[备用搜索-英文] 找到游戏但无法获取AppID: {game_name}")
+                        else:
+                            logger.warning(f"[备用搜索-英文] 未找到游戏: {input_text}")
+                            
+                except Exception as e:
+                    logger.error(f"备用搜索-英文失败: {e}")
+            
+            # 第五步：如果所有搜索都失败，尝试直接使用输入文本进行Steam搜索
+            if not appid:
+                try:
+                    logger.info(f"[备用搜索-最终] 尝试直接搜索: {input_text}")
+                    # 使用Steam商店搜索API（英文）
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        resp = await client.get(
+                            "https://store.steampowered.com/api/storesearch/",
+                            params={"term": input_text, "l": "english", "cc": "US"}
+                        )
+                        data = resp.json()
+                        
+                        if data and data.get("total", 0) > 0:
+                            # 取第一个匹配的游戏
+                            game = data["items"][0]
+                            appid = str(game.get("id", ""))
+                            game_name = game.get("name", "")
+                            
+                            if appid:
+                                logger.info(f"[备用搜索-最终成功] 游戏: {game_name}, AppID: {appid}")
+                            else:
+                                logger.warning(f"[备用搜索-最终] 找到游戏但无法获取AppID: {game_name}")
+                        else:
+                            logger.warning(f"[备用搜索-最终] 未找到游戏: {input_text}")
+                            
+                except Exception as e:
+                    logger.error(f"备用搜索-最终失败: {e}")
+            
+            if not appid:
+                yield event.plain_result("未找到该游戏，请检查游戏名是否正确，或尝试直接输入AppID。")
+                return
+        
+        # 获取当前会话标识
+        current_origin = event.unified_msg_origin
+        
+        # 添加到监控列表
+        if appid not in self.monitor_list:
+            self.monitor_list[appid] = {
+                "name": game_name,
+                "subscribers": [current_origin],
+                "last_price": None,
+                "original_price": None,
+                "discount": None
+            }
+            await self.save_monitor_list()
+            yield event.plain_result(f"✅ 已成功订阅游戏《{game_name}》的价格监控！\n当价格变动时，我会及时通知您。")
+        else:
+            # 检查是否已经订阅
+            subscribers = self.monitor_list[appid].get("subscribers", [])
+            if current_origin in subscribers:
+                yield event.plain_result(f"⚠️ 您已经订阅了游戏《{game_name}》的价格监控。")
+            else:
+                subscribers.append(current_origin)
+                self.monitor_list[appid]["subscribers"] = subscribers
+                await self.save_monitor_list()
+                yield event.plain_result(f"✅ 已成功订阅游戏《{game_name}》的价格监控！")
+
+    @filter.command("取消监控", alias={"取消订阅", "停止监控"})
+    async def cancel_monitor_command(self, event: AstrMessageEvent):
+        """取消价格监控"""
+        args = event.message_str.strip().split()[1:]
+        
+        if len(args) < 1:
+            yield event.plain_result("使用方法：/取消监控 <游戏名或AppID>\n例如：/取消监控 Cyberpunk 2077")
+            return
+        
+        input_text = " ".join(args)
+        current_origin = event.unified_msg_origin
+        
+        # 查找匹配的游戏
+        found_games = []
+        for appid, game_info in self.monitor_list.items():
+            if input_text.isdigit() and appid == input_text:
+                found_games.append((appid, game_info))
+            elif input_text.lower() in game_info["name"].lower():
+                found_games.append((appid, game_info))
+        
+        if not found_games:
+            yield event.plain_result("未找到匹配的监控游戏，请检查输入是否正确。")
+            return
+        
+        if len(found_games) > 1:
+            # 多个匹配，让用户选择
+            game_list = "\n".join([f"{i+1}. {info['name']} (AppID: {appid})" for i, (appid, info) in enumerate(found_games)])
+            yield event.plain_result(f"找到多个匹配的游戏，请选择：\n{game_list}\n\n请使用 /取消监控 <序号> 来取消订阅")
+            return
+        
+        # 单个匹配或指定序号
+        if input_text.isdigit() and len(found_games) == 1:
+            appid, game_info = found_games[0]
+        else:
+            # 处理序号选择
+            try:
+                index = int(input_text) - 1
+                if 0 <= index < len(found_games):
+                    appid, game_info = found_games[index]
+                else:
+                    yield event.plain_result("序号无效，请重新选择。")
+                    return
+            except ValueError:
+                appid, game_info = found_games[0]
+        
+        # 取消订阅
+        subscribers = game_info.get("subscribers", [])
+        if current_origin in subscribers:
+            subscribers.remove(current_origin)
+            
+            if subscribers:
+                # 还有其他订阅者，只移除当前用户
+                self.monitor_list[appid]["subscribers"] = subscribers
+                await self.save_monitor_list()
+                yield event.plain_result(f"✅ 已取消对游戏《{game_info['name']}》的价格监控订阅。")
+            else:
+                # 没有其他订阅者，移除整个游戏
+                del self.monitor_list[appid]
+                await self.save_monitor_list()
+                yield event.plain_result(f"✅ 已取消对游戏《{game_info['name']}》的价格监控订阅。")
+        else:
+            yield event.plain_result(f"⚠️ 您尚未订阅游戏《{game_info['name']}》的价格监控。")
+
+    @filter.command("监控列表")
+    async def monitor_list_command(self, event: AstrMessageEvent):
+        """查看当前监控的游戏列表"""
+        if not self.monitor_list:
+            yield event.plain_result("当前没有监控任何游戏。")
+            return
+        
+        current_origin = event.unified_msg_origin
+        
+        # 筛选当前用户订阅的游戏
+        user_games = []
+        for appid, game_info in self.monitor_list.items():
+            if current_origin in game_info.get("subscribers", []):
+                user_games.append((appid, game_info))
+        
+        if not user_games:
+            yield event.plain_result("您当前没有订阅任何游戏的价格监控。")
+            return
+        
+        message = "您当前订阅的价格监控游戏：\n"
+        for i, (appid, game_info) in enumerate(user_games, 1):
+            last_price = game_info.get("last_price")
+            price_str = f"¥{last_price:.2f}" if last_price is not None else "未记录"
+            message += f"{i}. 《{game_info['name']}》 - 当前价格: {price_str}\n"
+        
+        message += f"\n共监控 {len(user_games)} 个游戏"
+        yield event.plain_result(message)
