@@ -1,7 +1,7 @@
 # Steam Price Monitor - Steam价格监控插件
 
 ## 访问统计
-![访问统计](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https://github.com/Sakura520222/steam_price_monitor&count_bg=%2379C83D&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=访问量&edge_flat=false)
+![访问统计](https://visitor-badge.laobi.icu/badge?page_id=Sakura520222.steam_price_monitor)
 
 ## 简介
 
