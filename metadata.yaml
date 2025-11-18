@@ -1,8 +1,10 @@
-name: astrbot_plugins_steam_shop_price
-desc: 用于查询Steam游戏的国区价格、史低信息，并支持与其他区服价格对比。支持识别游戏中文名。
+name: steam_price_monitor
+desc: Steam Price Monitor - 专业的Steam游戏价格监控插件，支持国区价格查询、史低信息、多区服价格对比和自动价格监控。
 author: 车厘子小樱
-repo: https://github.com/Sakura520222/astrbot_plugins_steam_shop_price
-version: 1.0.0
+repo: https://github.com/Sakura520222/steam_price_monitor
+version: 2.0.0
 tags:
   - steam
+  - price
+  - monitor
 social_link: https://github.com/Sakura520222

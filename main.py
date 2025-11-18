@@ -16,8 +16,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 ITAD_API_BASE = "https://api.isthereanydeal.com"
 STEAMWEBAPI_PRICES = "https://api.steamwebapi.com/steam/prices"
 
-@register("astrbot_plugins_steam_shop_price", "Maoer", "查询Steam游戏价格及史低", "1.0.0", "https://github.com/Maoer233/astrbot_plugins_steam_shop_price")
-class SteamPricePlugin(Star):
+@register("steam_price_monitor", "Steam Price Monitor", "专业的Steam游戏价格监控插件", "2.0.0", "https://github.com/Sakura520222/steam_price_monitor")
+class SteamPriceMonitor(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config or {}
@@ -30,7 +30,7 @@ class SteamPricePlugin(Star):
         self.monitor_interval = self.config.get("PRICE_MONITOR_INTERVAL", 30)
         
         # 数据文件路径
-        self.data_dir = Path(StarTools.get_data_dir("astrbot_plugins_steam_shop_price"))
+        self.data_dir = Path(StarTools.get_data_dir("steam_price_monitor"))
         self.monitor_list_path = self.data_dir / "price_monitor_list.json"
         
         # 确保数据目录存在
