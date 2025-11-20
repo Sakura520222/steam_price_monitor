@@ -5,6 +5,9 @@ import asyncio  # 补充导入
 import datetime
 import json
 import os
+import time
+import io
+import base64
 from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
@@ -19,6 +22,17 @@ except ImportError:
             self.components = components
 from .price_convert import to_cny
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# 图表生成相关导入
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    import numpy as np
+    from matplotlib.ticker import FuncFormatter
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    logger.warning("matplotlib未安装，价格趋势图表功能将不可用")
 
 ITAD_API_BASE = "https://api.isthereanydeal.com"
 STEAMWEBAPI_PRICES = "https://api.steamwebapi.com/steam/prices"
@@ -39,6 +53,7 @@ class SteamPriceMonitor(Star):
         # 数据文件路径
         self.data_dir = Path(StarTools.get_data_dir("steam_price_monitor"))
         self.monitor_list_path = self.data_dir / "price_monitor_list.json"
+        self.price_history_path = self.data_dir / "price_history.json"
         
         # 确保数据目录存在
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +61,10 @@ class SteamPriceMonitor(Star):
         # 初始化监控列表
         self.monitor_list = {}
         self.monitor_list_lock = asyncio.Lock()
+        
+        # 初始化价格历史数据
+        self.price_history = {}
+        self.price_history_lock = asyncio.Lock()
         
         # 初始化调度器
         self.scheduler = AsyncIOScheduler()
@@ -60,8 +79,9 @@ class SteamPriceMonitor(Star):
             self.scheduler.start()
             logger.info(f"价格监控功能已启用，检查间隔：{self.monitor_interval}分钟")
         
-        # 加载监控列表
+        # 加载监控列表和价格历史数据
         asyncio.create_task(self.load_monitor_list())
+        asyncio.create_task(self.load_price_history())
 
     @filter.command("史低", alias={"价格", "price", "史低价格", "steam价格", "steam史低"})
     async def shidi(self, event: AstrMessageEvent, url: str, last_gid=None):
@@ -531,12 +551,24 @@ class SteamPriceMonitor(Star):
                 f"\n"
                 f"{price_diff}\n"
             )
+        # 记录价格历史数据
+        await self._record_price_history(appid, display_name, cn_price, cn_currency, cn_lowest, cn_cny)
+
         # 去除多余的游戏名（中括号内内容）
         msg = re.sub(r"\[.*?\]", "", msg)
         if steam_review:
             msg += f"好评率: {steam_review}"
         if appid:
             msg += f"\nsteam商店链接：https://store.steampowered.com/app/{appid}"
+            
+            # 检查是否有价格历史数据，如果有则添加查看趋势的提示
+            async with self.price_history_lock:
+                has_history = appid in self.price_history and len(self.price_history[appid]["history"]) > 0
+            
+            if has_history:
+                msg += f"\n\n📈 使用 /价格趋势 {appid} 查看价格趋势图表"
+                msg += f"\n📊 使用 /价格历史 {appid} 查看详细价格历史"
+        
         chain.append(Comp.Plain(msg))
         yield event.chain_result(chain)
 
@@ -857,6 +889,172 @@ class SteamPriceMonitor(Star):
             logger.error(f"_get_price_and_lowest error: {e}\n{traceback.format_exc()}")
             return None, None, None, None
 
+    async def _record_price_history(self, appid, game_name, current_price, currency, lowest_price, cny_price):
+        """记录价格历史数据"""
+        try:
+            if current_price is None:
+                return
+                
+            # 获取当前时间戳
+            timestamp = int(time.time())
+            
+            # 构建价格记录
+            price_record = {
+                "timestamp": timestamp,
+                "current_price": current_price,
+                "currency": currency,
+                "lowest_price": lowest_price,
+                "cny_price": cny_price
+            }
+            
+            # 更新价格历史数据
+            async with self.price_history_lock:
+                if appid not in self.price_history:
+                    self.price_history[appid] = {
+                        "game_name": game_name,
+                        "history": []
+                    }
+                
+                # 添加新的价格记录
+                self.price_history[appid]["history"].append(price_record)
+                
+                # 限制历史记录数量，最多保存100条记录
+                if len(self.price_history[appid]["history"]) > 100:
+                    self.price_history[appid]["history"] = self.price_history[appid]["history"][-100:]
+                
+                # 异步保存价格历史数据
+                asyncio.create_task(self.save_price_history())
+                
+            logger.info(f"价格历史记录成功: {game_name} (AppID: {appid}) - 当前价: {current_price} {currency}")
+            
+        except Exception as e:
+            logger.error(f"记录价格历史数据失败: {e}")
+
+    async def _generate_price_chart(self, appid, game_name, days=30):
+        """生成价格趋势图表
+        
+        Args:
+            appid (str): 游戏AppID
+            game_name (str): 游戏名称
+            days (int): 显示最近多少天的数据，默认30天
+            
+        Returns:
+            str or None: 图表的base64编码字符串，如果生成失败返回None
+        """
+        if not HAS_MATPLOTLIB:
+            logger.error("matplotlib未安装，无法生成价格趋势图表")
+            return None
+            
+        try:
+            # 获取价格历史数据
+            async with self.price_history_lock:
+                if appid not in self.price_history:
+                    logger.warning(f"游戏 {game_name} (AppID: {appid}) 没有价格历史数据")
+                    return None
+                    
+                game_data = self.price_history[appid]
+                history_records = game_data["history"]
+                
+                if len(history_records) < 2:
+                    logger.warning(f"游戏 {game_name} 的价格历史数据不足，无法生成图表")
+                    return None
+            
+            # 提取价格和时间数据
+            timestamps = []
+            current_prices = []
+            lowest_prices = []
+            cny_prices = []
+            
+            for record in history_records:
+                timestamp = record["timestamp"]
+                current_price = record["current_price"]
+                lowest_price = record["lowest_price"]
+                cny_price = record["cny_price"]
+                
+                # 过滤无效数据
+                if current_price is not None:
+                    timestamps.append(timestamp)
+                    current_prices.append(current_price)
+                    lowest_prices.append(lowest_price if lowest_price is not None else current_price)
+                    cny_prices.append(cny_price if cny_price is not None else current_price)
+            
+            if len(timestamps) < 2:
+                logger.warning(f"游戏 {game_name} 的有效价格数据不足，无法生成图表")
+                return None
+            
+            # 转换为datetime对象
+            dates = [datetime.datetime.fromtimestamp(ts) for ts in timestamps]
+            
+            # 过滤最近days天的数据
+            cutoff_date = datetime.datetime.now() - datetime.timedelta(days=days)
+            filtered_data = [(d, cp, lp, cny) for d, cp, lp, cny in zip(dates, current_prices, lowest_prices, cny_prices) if d >= cutoff_date]
+            
+            if not filtered_data:
+                logger.warning(f"游戏 {game_name} 在最近{days}天内没有价格数据")
+                return None
+                
+            dates, current_prices, lowest_prices, cny_prices = zip(*filtered_data)
+            
+            # 创建图表
+            plt.figure(figsize=(10, 6))
+            
+            # 设置中文字体（如果可用）
+            try:
+                plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+                plt.rcParams['axes.unicode_minus'] = False
+            except:
+                pass
+            
+            # 绘制价格曲线
+            plt.plot(dates, current_prices, 'b-', linewidth=2, label='当前价格', marker='o', markersize=4)
+            plt.plot(dates, lowest_prices, 'r--', linewidth=1.5, label='史低价格', alpha=0.7)
+            
+            # 设置图表标题和标签
+            plt.title(f'{game_name} 价格趋势图 (最近{days}天)', fontsize=14, fontweight='bold')
+            plt.xlabel('日期', fontsize=12)
+            plt.ylabel('价格', fontsize=12)
+            
+            # 设置日期格式
+            plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+            plt.gca().xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+            plt.xticks(rotation=45)
+            
+            # 设置价格格式
+            def price_formatter(x, pos):
+                if x >= 100:
+                    return f'¥{x:.0f}'
+                else:
+                    return f'¥{x:.1f}'
+            
+            plt.gca().yaxis.set_major_formatter(FuncFormatter(price_formatter))
+            
+            # 添加网格和图例
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            
+            # 自动调整布局
+            plt.tight_layout()
+            
+            # 将图表转换为base64编码的图片
+            buffer = io.BytesIO()
+            plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
+            buffer.seek(0)
+            
+            # 编码为base64
+            img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            
+            # 清理图表
+            plt.close()
+            
+            logger.info(f"价格趋势图表生成成功: {game_name}")
+            return img_base64
+            
+        except Exception as e:
+            logger.error(f"生成价格趋势图表失败: {e}\n{traceback.format_exc()}")
+            if 'plt' in locals():
+                plt.close()
+            return None
+
     # ==================== 价格监控功能 ====================
 
     async def load_monitor_list(self):
@@ -876,6 +1074,33 @@ class SteamPriceMonitor(Star):
         except Exception as e:
             logger.error(f"加载价格监控列表失败: {e}")
             self.monitor_list = {}
+
+    async def load_price_history(self):
+        """加载价格历史数据"""
+        try:
+            if self.price_history_path.exists():
+                async with self.price_history_lock:
+                    with open(self.price_history_path, 'r', encoding='utf-8') as f:
+                        self.price_history = json.load(f)
+                logger.info(f"价格历史数据加载成功，共 {len(self.price_history)} 个游戏")
+            else:
+                # 创建空的价格历史文件
+                async with self.price_history_lock:
+                    with open(self.price_history_path, 'w', encoding='utf-8') as f:
+                        json.dump({}, f, ensure_ascii=False, indent=2)
+                logger.info("创建新的价格历史数据文件")
+        except Exception as e:
+            logger.error(f"加载价格历史数据失败: {e}")
+            self.price_history = {}
+
+    async def save_price_history(self):
+        """保存价格历史数据"""
+        try:
+            async with self.price_history_lock:
+                with open(self.price_history_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.price_history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存价格历史数据失败: {e}")
 
     async def save_monitor_list(self):
         """保存价格监控列表"""
@@ -1357,5 +1582,156 @@ class SteamPriceMonitor(Star):
             message += f"{i}. 《{game_info['name']}》 - 当前价格: {price_str}\n"
         
         message += f"\n共监控 {len(user_games)} 个游戏"
+        yield event.plain_result(message)
+
+    @filter.command("价格趋势", alias={"趋势", "价格图表", "pricechart", "trend"})
+    async def price_trend_command(self, event: AstrMessageEvent):
+        """查询游戏价格趋势图表
+        格式：/价格趋势 <游戏名/AppID> [天数]
+        示例：/价格趋势 Cyberpunk 2077 30
+        """
+        if not HAS_MATPLOTLIB:
+            yield event.plain_result("⚠️ 价格趋势图表功能不可用，请确保已安装matplotlib。")
+            return
+            
+        # 解析参数
+        args = event.message_str.strip().split()[1:]
+        
+        if len(args) < 1:
+            yield event.plain_result("使用方法：/价格趋势 <游戏名或AppID> [天数]\n"
+                                   "示例：/价格趋势 Cyberpunk 2077\n"
+                                   "示例：/价格趋势 1091500 60")
+            return
+        
+        # 提取游戏名和天数参数
+        input_text = args[0]
+        days = 30  # 默认显示30天
+        
+        if len(args) > 1 and args[1].isdigit():
+            days = min(int(args[1]), 365)  # 限制最大365天
+            days = max(days, 1)  # 最小1天
+        
+        # 查找游戏
+        appid = None
+        game_name = None
+        
+        # 检查是否是AppID
+        if input_text.isdigit():
+            async with self.price_history_lock:
+                if input_text in self.price_history:
+                    appid = input_text
+                    game_name = self.price_history[appid]["game_name"]
+        
+        # 如果不是AppID，按游戏名搜索
+        if not appid:
+            async with self.price_history_lock:
+                for candidate_appid, game_data in self.price_history.items():
+                    if input_text.lower() in game_data["game_name"].lower():
+                        appid = candidate_appid
+                        game_name = game_data["game_name"]
+                        break
+        
+        if not appid:
+            yield event.plain_result(f"未找到游戏 '{input_text}' 的价格历史数据。\n"
+                                   "请先使用 /史低 命令查询游戏价格以生成历史数据。")
+            return
+        
+        # 生成价格趋势图表
+        yield event.plain_result(f"正在为《{game_name}》生成价格趋势图表，请稍候...")
+        
+        img_base64 = await self._generate_price_chart(appid, game_name, days)
+        
+        if img_base64:
+            # 构建包含图片的消息链
+            try:
+                chain = MessageChain([
+                    Comp.Plain(f"📊 《{game_name}》价格趋势图 (最近{days}天)\n"),
+                    Comp.Image(f"base64://{img_base64}"),
+                    Comp.Plain(f"\n💡 提示：图表显示最近{days}天的价格变化趋势\n"
+                              "蓝色实线：当前价格 | 红色虚线：史低价格")
+                ])
+                yield event.chain_result(chain)
+            except Exception as e:
+                logger.error(f"发送价格趋势图表失败: {e}")
+                yield event.plain_result(f"生成价格趋势图表成功，但发送失败。")
+        else:
+            yield event.plain_result(f"生成《{game_name}》的价格趋势图表失败，请稍后重试。")
+
+    @filter.command("价格历史", alias={"历史价格", "pricehistory", "history"})
+    async def price_history_command(self, event: AstrMessageEvent):
+        """查看游戏价格历史记录
+        格式：/价格历史 <游戏名/AppID>
+        """
+        # 解析参数
+        args = event.message_str.strip().split()[1:]
+        
+        if len(args) < 1:
+            yield event.plain_result("使用方法：/价格历史 <游戏名或AppID>\n"
+                                   "示例：/价格历史 Cyberpunk 2077")
+            return
+        
+        input_text = args[0]
+        
+        # 查找游戏
+        appid = None
+        game_name = None
+        
+        # 检查是否是AppID
+        if input_text.isdigit():
+            async with self.price_history_lock:
+                if input_text in self.price_history:
+                    appid = input_text
+                    game_name = self.price_history[appid]["game_name"]
+        
+        # 如果不是AppID，按游戏名搜索
+        if not appid:
+            async with self.price_history_lock:
+                for candidate_appid, game_data in self.price_history.items():
+                    if input_text.lower() in game_data["game_name"].lower():
+                        appid = candidate_appid
+                        game_name = game_data["game_name"]
+                        break
+        
+        if not appid:
+            yield event.plain_result(f"未找到游戏 '{input_text}' 的价格历史数据。\n"
+                                   "请先使用 /史低 命令查询游戏价格以生成历史数据。")
+            return
+        
+        # 获取价格历史记录
+        game_data = self.price_history[appid]
+        history_records = game_data["history"]
+        
+        if not history_records:
+            yield event.plain_result(f"《{game_name}》暂无价格历史记录。")
+            return
+        
+        # 显示最近10条记录
+        recent_records = history_records[-10:]
+        
+        message = f"📈 《{game_name}》价格历史记录 (最近10条)\n\n"
+        
+        for i, record in enumerate(recent_records, 1):
+            timestamp = record["timestamp"]
+            current_price = record["current_price"]
+            lowest_price = record["lowest_price"]
+            cny_price = record["cny_price"]
+            currency = record.get("currency", "CNY")
+            
+            # 格式化时间
+            dt = datetime.datetime.fromtimestamp(timestamp)
+            time_str = dt.strftime("%m-%d %H:%M")
+            
+            # 格式化价格
+            if current_price is not None:
+                price_str = f"{current_price:.2f} {currency}"
+                if cny_price is not None:
+                    price_str += f" (¥{cny_price:.2f})"
+                
+                if lowest_price is not None and lowest_price < current_price:
+                    price_str += f" | 史低: {lowest_price:.2f}"
+                
+                message += f"{i}. {time_str}: {price_str}\n"
+        
+        message += f"\n💡 共 {len(history_records)} 条记录，使用 /价格趋势 查看图表"
         yield event.plain_result(message)
 
