@@ -1,4 +1,5 @@
 name: SteamShopPrice
-author: "Your Name"
-version: "2.0.2"
+author: Sakura520222
+version: 3.0.0
 description: "查询Steam游戏价格，支持多区价格对比和历史最低价格查询"
+repo: https://github.com/Sakura520222/steam_price_monitor

@@ -37,7 +37,7 @@ except ImportError:
 ITAD_API_BASE = "https://api.isthereanydeal.com"
 STEAMWEBAPI_PRICES = "https://api.steamwebapi.com/steam/prices"
 
-@register("steam_price_monitor", "Steam Price Monitor", "专业的Steam游戏价格监控插件", "2.0.0", "https://github.com/Sakura520222/steam_price_monitor")
+@register("steam_price_monitor", "Steam Price Monitor", "专业的Steam游戏价格监控插件", "3.0.0", "https://github.com/Sakura520222/steam_price_monitor")
 class SteamPriceMonitor(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
