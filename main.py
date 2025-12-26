@@ -623,21 +623,31 @@ class SteamPriceMonitor(Star):
         if not appid or is_demo_version:
             # 尝试使用LLM将中文游戏名翻译为英文，如果失败则直接使用原始名称搜索
             game_search_name = param_str
+            # 语言检测：判断是否需要翻译
+            # 如果游戏名中包含较多英文字符，或者已经是英文游戏名，则跳过翻译
+            # 使用简单的字符统计来判断语言
+            total_chars = len(param_str)
+            english_chars = sum(1 for c in param_str if c.isascii() and (c.isalpha() or c.isdigit() or c in '!@#$%^&*()_+-=[]{}|;:,.<>?'))
+            # 如果英文占比超过60%，则认为是英文游戏名，直接使用原始名称搜索
+            is_english_name = (english_chars / total_chars) > 0.6 if total_chars > 0 else False
+            
+            game_en_name = param_str  # 默认使用原始名称
             try:
-                # 1. LLM翻译
-                prompt = f"请将以下游戏名翻译为steam页面的英文官方名称，仅输出英文名，不要输出其他内容：{param_str}"
-                logger.info(f"[LLM][查找游戏] 输入prompt: {prompt}")
-                llm_response = await self.context.get_using_provider().text_chat(
-                    prompt=prompt,
-                    contexts=[],
-                    image_urls=[],
-                    func_tool=None,
-                    system_prompt=""
-                )
-                game_en_name = llm_response.completion_text.strip()
-                if game_en_name and len(game_en_name) > 2:  # 确保翻译结果有效
-                    game_search_name = game_en_name
-                logger.info(f"[LLM][查找游戏] 输出: {game_en_name}")
+                if not is_english_name:  # 只有非英文游戏名才进行翻译
+                    # 1. LLM翻译
+                    prompt = f"请将以下游戏名翻译为steam页面的英文官方名称，仅输出英文名，不要输出其他内容：{param_str}"
+                    logger.info(f"[LLM][查找游戏] 输入prompt: {prompt}")
+                    llm_response = await self.context.get_using_provider().text_chat(
+                        prompt=prompt,
+                        contexts=[],
+                        image_urls=[],
+                        func_tool=None,
+                        system_prompt=""
+                    )
+                    game_en_name = llm_response.completion_text.strip()
+                    if game_en_name and len(game_en_name) > 2:  # 确保翻译结果有效
+                        game_search_name = game_en_name
+                    logger.info(f"[LLM][查找游戏] 输出: {game_en_name}")
                 # 修改提示，带上英文名
                 if is_demo_version:
                     yield event.plain_result(f"检测到体验版游戏，正在为主人查找完整版游戏《{param_str}》（英文：{game_en_name}），请稍等...")
